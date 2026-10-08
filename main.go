@@ -1,31 +1,41 @@
 package main
 
 import (
-	"crypto/rand"
-	"embed"
-	"encoding/hex"
-	"encoding/json"
 	"fmt"
-	"io"
-	"net"
-	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
-	"sync"
 	"time"
+
+	"github.com/lxn/walk"
+	. "github.com/lxn/walk/declarative"
 )
 
-//go:embed index.html
-var assets embed.FS
+const maxRows = 6
 
-var (
-	mu      sync.Mutex
-	current []byte // loaded PC save (already converted if it came from Xbox 360)
-	token   string
-)
+var names = map[string]string{
+	"WS_Weapon_Gun": "Boner", "WS_Weapon_Gun_Level2": "Hot Boner",
+	"WS_Weapon_Assault": "Teether", "WS_Weapon_Assault_Level2": "Teethgrinder",
+	"WS_Weapon_ShotGun": "Skullblaster", "WS_Weapon_ShotGun_Level2": "Skullfest",
+}
+
+type row struct {
+	label *walk.Label
+	edits [3]*walk.NumberEdit
+}
+
+type app struct {
+	mw                              *walk.MainWindow
+	fileLbl, levelLbl, timeLbl, msg *walk.Label
+	convLbl                         *walk.Label
+	gems                            *walk.NumberEdit
+	rows                            [maxRows]row
+	editBox                         *walk.Composite
+	saveBtn, saveAsBtn, undoBtn     *walk.PushButton
+	current                         []byte
+	orig                            State
+	loaded                          bool
+}
 
 func saveDir() string {
 	h, _ := os.UserHomeDir()
@@ -33,177 +43,250 @@ func saveDir() string {
 }
 func savePath() string { return filepath.Join(saveDir(), "AUTOSAVE0.sav") }
 
-func jsonOut(w http.ResponseWriter, code int, v interface{}) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(code)
-	json.NewEncoder(w).Encode(v)
-}
-func fail(w http.ResponseWriter, msg string) { jsonOut(w, 400, map[string]string{"error": msg}) }
+func shortName(cls string) string { return cls[strings.LastIndex(cls, ".")+1:] }
 
-func guard(h http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("X-Token") != token {
-			http.Error(w, "forbidden", 403)
-			return
-		}
-		h(w, r)
+func kind(cls string) string {
+	switch {
+	case strings.Contains(cls, "ShotGun"):
+		return "shotgun"
+	case strings.Contains(cls, "Assault"):
+		return "rifle"
 	}
+	return "pistol"
 }
 
-// loadBytes converts Xbox 360 saves to PC before loading
-func loadBytes(b []byte) (map[string]interface{}, error) {
+func (a *app) errorBox(msg string) {
+	walk.MsgBox(a.mw, "SOTD Save Tool", msg, walk.MsgBoxIconError|walk.MsgBoxOK)
+}
+
+func (a *app) load(path string) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		a.errorBox("Could not read the file:\n" + err.Error())
+		return
+	}
 	converted := false
 	if !isPC(b) {
 		pc, err := convert360(b)
 		if err != nil {
-			return nil, err
+			a.errorBox(err.Error())
+			return
 		}
 		b, converted = pc, true
 	}
 	st, err := readState(b)
 	if err != nil {
-		return nil, err
+		a.errorBox(err.Error())
+		return
 	}
-	mu.Lock()
-	current = b
-	mu.Unlock()
-	return map[string]interface{}{"state": st, "converted": converted}, nil
+	a.current, a.orig, a.loaded = b, st, true
+	a.fileLbl.SetText(path)
+	a.convLbl.SetVisible(converted)
+	a.show(st)
+	a.setEnabled(true)
+	if converted {
+		a.msg.SetText("Xbox 360 save converted. Not saved yet.")
+	} else {
+		a.msg.SetText("Save loaded.")
+	}
 }
 
-func backup() (string, error) {
-	src := savePath()
-	b, err := os.ReadFile(src)
-	if os.IsNotExist(err) {
-		return "", nil
+func (a *app) show(st State) {
+	a.levelLbl.SetText(st.Map)
+	s := int(st.Time + 0.5)
+	a.timeLbl.SetText(fmt.Sprintf("%d h %d min", s/3600, s%3600/60))
+	a.gems.SetValue(float64(st.Gems))
+	for i := range a.rows {
+		r := a.rows[i]
+		vis := i < len(st.Weapons)
+		r.label.SetVisible(vis)
+		for j := 0; j < 3; j++ {
+			r.edits[j].SetVisible(vis)
+		}
+		if !vis {
+			continue
+		}
+		w := st.Weapons[i]
+		n := names[shortName(w.Cls)]
+		if n == "" {
+			n = shortName(w.Cls)
+		}
+		r.label.SetText(n + " (" + kind(w.Cls) + ")")
+		for j := 0; j < 3; j++ {
+			r.edits[j].SetValue(float64(w.Up[j]))
+		}
 	}
+}
+
+func (a *app) collect() State {
+	st := a.orig
+	st.Weapons = append([]Weapon(nil), a.orig.Weapons...)
+	st.Gems = uint32(a.gems.Value())
+	for i := range st.Weapons {
+		if i >= maxRows {
+			break
+		}
+		for j := 0; j < 3; j++ {
+			st.Weapons[i].Up[j] = uint32(a.rows[i].edits[j].Value())
+		}
+	}
+	return st
+}
+
+func (a *app) build() ([]byte, bool) {
+	out, err := applyState(a.current, a.collect())
 	if err != nil {
-		return "", err
+		a.errorBox(err.Error())
+		return nil, false
 	}
-	dst := filepath.Join(saveDir(), "AUTOSAVE0.sav.backup-"+time.Now().Format("20060102-150405"))
-	return dst, os.WriteFile(dst, b, 0644)
+	return out, true
+}
+
+func (a *app) saveToGame() {
+	if !a.loaded {
+		return
+	}
+	if walk.MsgBox(a.mw, "Save to game folder",
+		"The save will be written to:\n"+savePath()+"\n\nYour current AUTOSAVE0.sav will be backed up first.\n\nIs the game closed?",
+		walk.MsgBoxIconQuestion|walk.MsgBoxYesNo) != walk.DlgCmdYes {
+		return
+	}
+	out, ok := a.build()
+	if !ok {
+		return
+	}
+	if err := os.MkdirAll(saveDir(), 0755); err != nil {
+		a.errorBox("Cannot create the save folder:\n" + err.Error())
+		return
+	}
+	backup := ""
+	if old, err := os.ReadFile(savePath()); err == nil {
+		backup = savePath() + ".backup-" + time.Now().Format("20060102-150405")
+		if err := os.WriteFile(backup, old, 0644); err != nil {
+			a.errorBox("Backup failed, nothing was saved:\n" + err.Error())
+			return
+		}
+	}
+	if err := os.WriteFile(savePath(), out, 0644); err != nil {
+		a.errorBox("Could not write the save:\n" + err.Error())
+		return
+	}
+	a.current, a.orig = out, a.collect()
+	a.convLbl.SetVisible(false)
+	m := "Saved to the game folder."
+	if backup != "" {
+		m += " Backup: " + filepath.Base(backup)
+	}
+	a.msg.SetText(m)
+}
+
+func (a *app) saveAs() {
+	if !a.loaded {
+		return
+	}
+	out, ok := a.build()
+	if !ok {
+		return
+	}
+	dlg := &walk.FileDialog{Title: "Save as", Filter: "Save files (*.sav)|*.sav|All files (*.*)|*.*", FilePath: "AUTOSAVE0.sav"}
+	if ok, _ := dlg.ShowSave(a.mw); !ok {
+		return
+	}
+	p := dlg.FilePath
+	if filepath.Ext(p) == "" {
+		p += ".sav"
+	}
+	if err := os.WriteFile(p, out, 0644); err != nil {
+		a.errorBox("Could not write the file:\n" + err.Error())
+		return
+	}
+	a.msg.SetText("Saved to " + p)
+}
+
+func (a *app) openFile() {
+	dlg := &walk.FileDialog{Title: "Open save (PC or Xbox 360)", Filter: "Save files (*.sav)|*.sav|All files (*.*)|*.*"}
+	if _, err := os.Stat(saveDir()); err == nil {
+		dlg.InitialDirPath = saveDir()
+	}
+	if ok, _ := dlg.ShowOpen(a.mw); ok {
+		a.load(dlg.FilePath)
+	}
+}
+
+func (a *app) setEnabled(on bool) {
+	a.editBox.SetEnabled(on)
+	a.saveBtn.SetEnabled(on)
+	a.saveAsBtn.SetEnabled(on)
+	a.undoBtn.SetEnabled(on)
+}
+
+func upgradeEdit(target **walk.NumberEdit) Widget {
+	return NumberEdit{AssignTo: target, MinValue: 0, MaxValue: 5, Decimals: 0, SpinButtonsVisible: true, MaxSize: Size{Width: 70}}
 }
 
 func main() {
-	rb := make([]byte, 16)
-	rand.Read(rb)
-	token = hex.EncodeToString(rb)
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/" {
-			http.NotFound(w, r)
-			return
-		}
-		page, _ := assets.ReadFile("index.html")
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.Write([]byte(strings.Replace(string(page), "__TOKEN__", token, 1)))
-	})
-	mux.HandleFunc("/api/info", guard(func(w http.ResponseWriter, r *http.Request) {
-		_, err := os.Stat(savePath())
-		jsonOut(w, 200, map[string]interface{}{"dir": saveDir(), "exists": err == nil})
-	}))
-	mux.HandleFunc("/api/open", guard(func(w http.ResponseWriter, r *http.Request) {
-		b, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
-		if err != nil || len(b) == 0 {
-			fail(w, "No file received.")
-			return
-		}
-		res, err := loadBytes(b)
-		if err != nil {
-			fail(w, err.Error())
-			return
-		}
-		jsonOut(w, 200, res)
-	}))
-	mux.HandleFunc("/api/open-game", guard(func(w http.ResponseWriter, r *http.Request) {
-		b, err := os.ReadFile(savePath())
-		if err != nil {
-			fail(w, "File not found: "+savePath())
-			return
-		}
-		res, err := loadBytes(b)
-		if err != nil {
-			fail(w, err.Error())
-			return
-		}
-		jsonOut(w, 200, res)
-	}))
-	edited := func(r *http.Request) ([]byte, error) {
-		var st State
-		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(&st); err != nil {
-			return nil, fmt.Errorf("invalid data")
-		}
-		if st.Gems > 99999 {
-			return nil, fmt.Errorf("gems must be between 0 and 99999")
-		}
-		for _, wp := range st.Weapons {
-			for _, v := range wp.Up {
-				if v > 5 {
-					return nil, fmt.Errorf("upgrades must be between 0 and 5")
-				}
-			}
-		}
-		mu.Lock()
-		cur := current
-		mu.Unlock()
-		if cur == nil {
-			return nil, fmt.Errorf("open a save first")
-		}
-		return applyState(cur, st)
+	a := &app{}
+	grid := []Widget{
+		Label{Text: "Weapon", Font: Font{Bold: true}},
+		Label{Text: "Upgrade 1", Font: Font{Bold: true}},
+		Label{Text: "Upgrade 2", Font: Font{Bold: true}},
+		Label{Text: "Upgrade 3", Font: Font{Bold: true}},
 	}
-	mux.HandleFunc("/api/save-game", guard(func(w http.ResponseWriter, r *http.Request) {
-		out, err := edited(r)
-		if err != nil {
-			fail(w, err.Error())
-			return
+	for i := 0; i < maxRows; i++ {
+		grid = append(grid, Label{AssignTo: &a.rows[i].label, Visible: false})
+		for j := 0; j < 3; j++ {
+			e := upgradeEdit(&a.rows[i].edits[j])
+			ne := e.(NumberEdit)
+			ne.Visible = false
+			grid = append(grid, ne)
 		}
-		if err := os.MkdirAll(saveDir(), 0755); err != nil {
-			fail(w, "Cannot create the save folder: "+err.Error())
-			return
-		}
-		bk, err := backup()
-		if err != nil {
-			fail(w, "Backup failed, nothing was saved: "+err.Error())
-			return
-		}
-		if err := os.WriteFile(savePath(), out, 0644); err != nil {
-			fail(w, "Could not write the save: "+err.Error())
-			return
-		}
-		mu.Lock()
-		current = out
-		mu.Unlock()
-		jsonOut(w, 200, map[string]string{"path": savePath(), "backup": bk})
-	}))
-	mux.HandleFunc("/api/download", guard(func(w http.ResponseWriter, r *http.Request) {
-		out, err := edited(r)
-		if err != nil {
-			fail(w, err.Error())
-			return
-		}
-		w.Header().Set("Content-Type", "application/octet-stream")
-		w.Header().Set("Content-Disposition", `attachment; filename="AUTOSAVE0.sav"`)
-		w.Write(out)
-	}))
+	}
+	_, gameExists := os.Stat(savePath())
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	err := MainWindow{
+		AssignTo: &a.mw,
+		Title:    "SOTD Save Tool",
+		MinSize:  Size{Width: 520, Height: 520},
+		Size:     Size{Width: 560, Height: 580},
+		Layout:   VBox{Margins: Margins{Left: 14, Top: 12, Right: 14, Bottom: 12}, Spacing: 10},
+		Children: []Widget{
+			Label{Text: "Shadows of the Damned: Hella Remastered", Font: Font{PointSize: 12, Bold: true}},
+			Label{Text: "Convert Xbox 360 saves to PC and edit white gems and weapon upgrades."},
+			Composite{Layout: HBox{MarginsZero: true}, Children: []Widget{
+				PushButton{Text: "Load my PC save", Enabled: gameExists == nil, OnClicked: func() { a.load(savePath()) }},
+				PushButton{Text: "Open .sav file (PC or Xbox 360)...", OnClicked: a.openFile},
+				HSpacer{},
+			}},
+			Label{Text: "Save folder: " + saveDir(), TextColor: walk.RGB(110, 110, 110)},
+			Label{AssignTo: &a.convLbl, Visible: false, Font: Font{Bold: true}, TextColor: walk.RGB(190, 20, 110),
+				Text: "Xbox 360 save converted to the PC format. Check the values and save it."},
+			GroupBox{Title: "Save", Layout: Grid{Columns: 2}, Children: []Widget{
+				Label{Text: "File:"}, Label{AssignTo: &a.fileLbl, Text: "-"},
+				Label{Text: "Level:"}, Label{AssignTo: &a.levelLbl, Text: "-"},
+				Label{Text: "Play time:"}, Label{AssignTo: &a.timeLbl, Text: "-"},
+			}},
+			Composite{AssignTo: &a.editBox, Enabled: false, Layout: VBox{MarginsZero: true}, Children: []Widget{
+				GroupBox{Title: "White gems", Layout: HBox{}, Children: []Widget{
+					NumberEdit{AssignTo: &a.gems, MinValue: 0, MaxValue: 99999, Decimals: 0, SpinButtonsVisible: true, MaxSize: Size{Width: 110}},
+					HSpacer{},
+				}},
+				GroupBox{Title: "Weapon upgrades", Layout: Grid{Columns: 4}, Children: grid},
+				Label{Text: "Columns follow the order the game shows (e.g. 3/2/0). The maximum level is unconfirmed; 0 to 5 allowed.",
+					TextColor: walk.RGB(110, 110, 110)},
+			}},
+			VSpacer{},
+			Composite{Layout: HBox{MarginsZero: true}, Children: []Widget{
+				PushButton{AssignTo: &a.saveBtn, Text: "Save to game folder", Enabled: false, OnClicked: a.saveToGame},
+				PushButton{AssignTo: &a.saveAsBtn, Text: "Save as...", Enabled: false, OnClicked: a.saveAs},
+				PushButton{AssignTo: &a.undoBtn, Text: "Undo changes", Enabled: false, OnClicked: func() { a.show(a.orig); a.msg.SetText("Changes undone.") }},
+				HSpacer{},
+			}},
+			Label{AssignTo: &a.msg, Text: "Open a save to start."},
+		},
+	}.Create()
 	if err != nil {
-		fmt.Println("Could not start the program:", err)
-		fmt.Scanln()
+		walk.MsgBox(nil, "SOTD Save Tool", "Could not start: "+err.Error(), walk.MsgBoxIconError)
 		return
 	}
-	url := "http://" + ln.Addr().String() + "/"
-	fmt.Println("SOTD Save Tool - Shadows of the Damned: Hella Remastered")
-	fmt.Println()
-	fmt.Println("Your browser will open. If it does not, go to:")
-	fmt.Println("  " + url)
-	fmt.Println()
-	fmt.Println("To exit, close this window.")
-	go func() {
-		time.Sleep(400 * time.Millisecond)
-		if runtime.GOOS == "windows" {
-			exec.Command("rundll32", "url.dll,FileProtocolHandler", url).Start()
-		}
-	}()
-	http.Serve(ln, mux)
+	a.mw.Run()
 }

@@ -1,6 +1,6 @@
 # SOTD Save Tool
 
-A small Windows tool for **Shadows of the Damned: Hella Remastered** (Steam):
+A native Windows tool for **Shadows of the Damned: Hella Remastered** (Steam):
 
 - Converts **Xbox 360** saves (`.sav`, format version 2) to the remaster's PC format (version 8).
 - Edits **white gems** and **weapon upgrades** in a PC save.
@@ -9,9 +9,9 @@ A small Windows tool for **Shadows of the Damned: Hella Remastered** (Steam):
 ## Usage
 
 1. Download `SOTD-Save-Tool.exe` from the *Releases* section.
-2. Run it: a console window opens and the interface loads in your browser (only reachable from your own computer).
-3. Load your PC save, or open a PC or Xbox 360 `.sav` file (Xbox 360 saves are converted automatically).
-4. Edit the values and click **Save to game folder** with the game closed.
+2. Run it. No installation needed.
+3. Click **Load my PC save**, or **Open .sav file** to pick a PC or Xbox 360 save (Xbox 360 saves are converted automatically).
+4. Edit the values and click **Save to game folder** with the game closed, or **Save as...** to write the file elsewhere.
 
 Save folder: `%USERPROFILE%\Saved Games\Shadows Of The Damned\`
 
@@ -24,10 +24,12 @@ Save folder: `%USERPROFILE%\Saved Games\Shadows Of The Damned\`
 
 ## Building
 
-Requires Go 1.22 or later, no external dependencies:
+Requires Go 1.22 or later. The interface uses [lxn/walk](https://github.com/lxn/walk) (native Win32 controls, no CGO).
 
 ```
-GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o SOTD-Save-Tool.exe .
+go install github.com/akavel/rsrc@latest
+rsrc -manifest app.manifest -ico app.ico -arch amd64 -o rsrc_windows_amd64.syso
+GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -H windowsgui" -o SOTD-Save-Tool.exe .
 ```
 
 ## Disclaimer
